@@ -2,13 +2,15 @@ name: Update AUR Packages
 
 on:
   schedule:
-    # Check for new versions every 6 hours
     - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       package:
         description: "Package to update (leave empty for all)"
         required: false
+
+permissions:
+  contents: write
 
 jobs:
   check-versions:
@@ -26,52 +28,44 @@ jobs:
         id: check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PACKAGE: ${{ github.event.inputs.package }}
         run: |
-          # nvchecker needs the token for GitHub API
-          cat > keyfile.toml <<EOF
+          cat > keyfile.toml <<'TOML'
           [keys]
-          github = "${GITHUB_TOKEN}"
-          EOF
+          TOML
+          echo "github = \"${GITHUB_TOKEN}\"" >> keyfile.toml
 
           nvchecker -c nvchecker.toml --keyfile keyfile.toml
           rm -f keyfile.toml
 
-          # Compare versions and build matrix
-          UPDATES="[]"
-          if [[ -f new_ver.json ]]; then
-            while IFS='=' read -r pkg newver; do
-              pkg=$(echo "$pkg" | tr -d '"' | xargs)
-              newver=$(echo "$newver" | tr -d '"' | xargs)
-              [[ -z "$pkg" || "$pkg" == "{" || "$pkg" == "}" ]] && continue
+          python3 <<'PYEOF'
+          import json, os
 
-              oldver=$(python3 -c "import json; d=json.load(open('old_ver.json')); print(d.get('$pkg', ''))" 2>/dev/null || echo "")
+          old = json.load(open("old_ver.json"))
+          try:
+              new = json.load(open("new_ver.json"))
+          except FileNotFoundError:
+              new = {}
 
-              if [[ "$newver" != "$oldver" ]]; then
-                echo "==> ${pkg}: ${oldver} -> ${newver}"
+          filter_pkg = os.environ.get("INPUT_PACKAGE", "").strip()
+          updates = []
 
-                # Filter by input if specified
-                if [[ -n "${{ github.event.inputs.package }}" && "${{ github.event.inputs.package }}" != "$pkg" ]]; then
-                  continue
-                fi
+          for pkg, newver in new.items():
+              oldver = old.get(pkg, "")
+              if newver != oldver:
+                  print(f"==> {pkg}: {oldver} -> {newver}")
+                  if filter_pkg and filter_pkg != pkg:
+                      continue
+                  updates.append({"package": pkg, "version": newver})
 
-                UPDATES=$(echo "$UPDATES" | python3 -c "
-          import json, sys
-          arr = json.load(sys.stdin)
-          arr.append({'package': '$pkg', 'version': '$newver'})
-          print(json.dumps(arr))
-          ")
-              fi
-            done < <(python3 -c "import json; [print(f'{k}={v}') for k,v in json.load(open('new_ver.json')).items()]")
-          fi
+          if not updates:
+              print("==> All packages are up to date")
 
-          if [[ "$UPDATES" == "[]" ]]; then
-            echo "==> All packages are up to date"
-            echo "has_updates=false" >> "$GITHUB_OUTPUT"
-            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_updates=true" >> "$GITHUB_OUTPUT"
-            echo "matrix={\"include\":${UPDATES}}" >> "$GITHUB_OUTPUT"
-          fi
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"has_updates={'true' if updates else 'false'}\n")
+              matrix = json.dumps({"include": updates})
+              f.write(f"matrix={matrix}\n")
+          PYEOF
 
   update-and-publish:
     needs: check-versions
@@ -86,7 +80,7 @@ jobs:
       - name: Setup Arch Linux
         run: |
           pacman -Syu --noconfirm
-          pacman -S --noconfirm base-devel git openssh pacman-contrib
+          pacman -S --noconfirm base-devel git openssh pacman-contrib python
 
       - uses: actions/checkout@v4
 
@@ -95,17 +89,14 @@ jobs:
           PKG_DIR="packages/${{ matrix.package }}"
           PKGBUILD="${PKG_DIR}/PKGBUILD"
 
-          # Update pkgver
           sed -i "s/^pkgver=.*/pkgver=${{ matrix.version }}/" "$PKGBUILD"
           sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKGBUILD"
 
-          # Recalculate checksums
           cd "$PKG_DIR"
           updpkgsums
 
       - name: Test build
         run: |
-          # Create a non-root user for makepkg
           useradd -m builder
           chown -R builder:builder .
 
@@ -115,42 +106,39 @@ jobs:
       - name: Publish to AUR
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_USERNAME: ${{ vars.AUR_USERNAME }}
+          AUR_EMAIL: ${{ vars.AUR_EMAIL }}
         run: |
-          # Setup SSH
           mkdir -p /root/.ssh
           echo "$AUR_SSH_PRIVATE_KEY" > /root/.ssh/id_ed25519
           chmod 600 /root/.ssh/id_ed25519
           ssh-keyscan -t ed25519 aur.archlinux.org >> /root/.ssh/known_hosts 2>/dev/null
 
-          # Configure git
-          git config --global user.name "${{ vars.AUR_USERNAME }}"
-          git config --global user.email "${{ vars.AUR_EMAIL }}"
+          git config --global user.name "$AUR_USERNAME"
+          git config --global user.email "$AUR_EMAIL"
 
           PKGNAME="${{ matrix.package }}"
           PKGVER="${{ matrix.version }}"
           AUR_DIR="/tmp/aur-${PKGNAME}"
 
-          # Clone AUR repo
-          git clone "ssh://aur@aur.archlinux.org/${PKGNAME}.git" "$AUR_DIR" 2>/dev/null || {
+          git clone "ssh://aur@aur.archlinux.org/${PKGNAME}.git" "$AUR_DIR" || {
             mkdir -p "$AUR_DIR"
             cd "$AUR_DIR"
-            git init
+            git init -b master
             git remote add origin "ssh://aur@aur.archlinux.org/${PKGNAME}.git"
           }
 
-          # Copy PKGBUILD and extra files
           cp "packages/${PKGNAME}/PKGBUILD" "$AUR_DIR/"
           for f in "packages/${PKGNAME}"/*.install "packages/${PKGNAME}"/*.patch; do
             [[ -f "$f" ]] && cp "$f" "$AUR_DIR/"
           done
 
-          # Generate .SRCINFO (needs makepkg, run as builder)
           chown -R builder:builder "$AUR_DIR"
           cd "$AUR_DIR"
           su builder -c "makepkg --printsrcinfo > .SRCINFO"
 
-          # Commit and push (as root, who has SSH key)
           chown -R root:root "$AUR_DIR"
+          git checkout -B master 2>/dev/null || true
           git add -A
           if ! git diff --cached --quiet; then
             git commit -m "Update ${PKGNAME} to ${PKGVER}"
@@ -158,23 +146,24 @@ jobs:
             echo "==> Published ${PKGNAME} v${PKGVER} to AUR"
           fi
 
-      - name: Update version state
+      - name: Prepare updated PKGBUILD
         run: |
-          # Update old_ver.json
+          mkdir -p /tmp/artifacts
+          cp "packages/${{ matrix.package }}/PKGBUILD" "/tmp/artifacts/PKGBUILD-${{ matrix.package }}"
+
           python3 -c "
           import json
-          with open('old_ver.json', 'r') as f:
-              data = json.load(f)
+          data = json.load(open('old_ver.json'))
           data['${{ matrix.package }}'] = '${{ matrix.version }}'
-          with open('old_ver.json', 'w') as f:
-              json.dump(data, f, indent=2)
+          json.dump(data, open('old_ver.json', 'w'), indent=2)
           "
+          cp old_ver.json /tmp/artifacts/
 
-      - name: Upload updated state
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ver-state-${{ matrix.package }}
-          path: old_ver.json
+          name: update-${{ matrix.package }}
+          path: /tmp/artifacts/
 
   commit-state:
     needs: update-and-publish
@@ -183,50 +172,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download version state artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: ver-state-*
+          pattern: update-*
           merge-multiple: true
 
-      - name: Also update PKGBUILD in repo
+      - name: Apply updates to repo
         run: |
-          # Re-run nvchecker to get latest versions
-          pip install nvchecker
-          cat > keyfile.toml <<EOF
-          [keys]
-          github = "${{ secrets.GITHUB_TOKEN }}"
-          EOF
-          nvchecker -c nvchecker.toml --keyfile keyfile.toml
-          rm -f keyfile.toml
-
-          # Update PKGBUILDs with new versions
-          if [[ -f new_ver.json ]]; then
-            python3 -c "
-          import json
-          old = json.load(open('old_ver.json'))
-          new = json.load(open('new_ver.json'))
-          for pkg, ver in new.items():
-              if old.get(pkg) != ver:
-                  # Update PKGBUILD
-                  import re
-                  pkgbuild = f'packages/{pkg}/PKGBUILD'
-                  try:
-                      content = open(pkgbuild).read()
-                      content = re.sub(r'^pkgver=.*', f'pkgver={ver}', content, flags=re.MULTILINE)
-                      content = re.sub(r'^pkgrel=.*', 'pkgrel=1', content, flags=re.MULTILINE)
-                      # Clear checksums (will be recalculated next run if needed)
-                      open(pkgbuild, 'w').write(content)
-                  except FileNotFoundError:
-                      pass
-          "
-          fi
+          # Move updated PKGBUILDs back
+          for f in PKGBUILD-*; do
+            [[ -f "$f" ]] || continue
+            pkg="${f#PKGBUILD-}"
+            cp "$f" "packages/${pkg}/PKGBUILD"
+          done
 
       - name: Commit updated state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add old_ver.json packages/*/PKGBUILD
+          git add old_ver.json "packages/*/PKGBUILD"
           if ! git diff --cached --quiet; then
             git commit -m "chore: update package versions [skip ci]"
             git push
