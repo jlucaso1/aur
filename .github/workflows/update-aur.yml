@@ -41,22 +41,31 @@ jobs:
           python3 <<'PYEOF'
           import json, os
 
-          old = json.load(open("old_ver.json"))
+          # nvchecker v2 format: {"version": N, "data": {"pkg": {"version": "..."}}}
+          old_raw = json.load(open("old_ver.json"))
+          old_data = old_raw.get("data", old_raw)
+
           try:
-              new = json.load(open("new_ver.json"))
+              new_raw = json.load(open("new_ver.json"))
+              new_data = new_raw.get("data", new_raw)
           except FileNotFoundError:
-              new = {}
+              new_data = {}
 
           filter_pkg = os.environ.get("INPUT_PACKAGE", "").strip()
           updates = []
 
-          for pkg, newver in new.items():
-              oldver = old.get(pkg, "")
+          for pkg, new_info in new_data.items():
+              newver = new_info["version"] if isinstance(new_info, dict) else new_info
+              old_info = old_data.get(pkg, {})
+              oldver = old_info.get("version", "") if isinstance(old_info, dict) else old_info
+
               if newver != oldver:
                   print(f"==> {pkg}: {oldver} -> {newver}")
                   if filter_pkg and filter_pkg != pkg:
                       continue
                   updates.append({"package": pkg, "version": newver})
+              else:
+                  print(f"==> {pkg}: {oldver} (up to date)")
 
           if not updates:
               print("==> All packages are up to date")
@@ -154,7 +163,9 @@ jobs:
           python3 -c "
           import json
           data = json.load(open('old_ver.json'))
-          data['${{ matrix.package }}'] = '${{ matrix.version }}'
+          if 'data' not in data:
+              data = {'version': 1, 'data': data}
+          data['data']['${{ matrix.package }}'] = {'version': '${{ matrix.version }}'}
           json.dump(data, open('old_ver.json', 'w'), indent=2)
           "
           cp old_ver.json /tmp/artifacts/
