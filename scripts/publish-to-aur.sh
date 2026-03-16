@@ -27,7 +27,7 @@ git clone "ssh://aur@aur.archlinux.org/${PKGNAME}.git" "$AUR_DIR" 2>/dev/null ||
     echo "==> Package doesn't exist on AUR yet, creating new repo"
     mkdir -p "$AUR_DIR"
     cd "$AUR_DIR"
-    git init
+    git init -b master
     git remote add origin "ssh://aur@aur.archlinux.org/${PKGNAME}.git"
 }
 
@@ -43,6 +43,9 @@ cd "$AUR_DIR"
 
 # Generate .SRCINFO
 makepkg --printsrcinfo > .SRCINFO
+
+# Ensure we're on master branch
+git checkout -B master 2>/dev/null || true
 
 # Commit and push
 git add -A
