@@ -104,7 +104,7 @@ jobs:
 
           chown -R builder:builder "$PKG_DIR"
           cd "$PKG_DIR"
-          su builder -c "updpkgsums && makepkg -sf --noconfirm"
+          su builder -c "updpkgsums && makepkg -sf --noconfirm --nodeps"
           chown -R root:root "$PKG_DIR"
 
       - name: Publish to AUR
