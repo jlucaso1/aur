@@ -90,10 +90,11 @@ jobs:
         run: |
           pacman -Syu --noconfirm
           pacman -S --noconfirm base-devel git openssh pacman-contrib python
+          useradd -m builder
 
       - uses: actions/checkout@v4
 
-      - name: Update PKGBUILD
+      - name: Update PKGBUILD and test build
         run: |
           PKG_DIR="packages/${{ matrix.package }}"
           PKGBUILD="${PKG_DIR}/PKGBUILD"
@@ -101,16 +102,10 @@ jobs:
           sed -i "s/^pkgver=.*/pkgver=${{ matrix.version }}/" "$PKGBUILD"
           sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKGBUILD"
 
+          chown -R builder:builder "$PKG_DIR"
           cd "$PKG_DIR"
-          updpkgsums
-
-      - name: Test build
-        run: |
-          useradd -m builder
-          chown -R builder:builder .
-
-          cd "packages/${{ matrix.package }}"
-          su builder -c "makepkg -sf --noconfirm"
+          su builder -c "updpkgsums && makepkg -sf --noconfirm"
+          chown -R root:root "$PKG_DIR"
 
       - name: Publish to AUR
         env:
